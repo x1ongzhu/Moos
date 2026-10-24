@@ -1,0 +1,3 @@
+*cc1:
+-msoft-float -m68000
+

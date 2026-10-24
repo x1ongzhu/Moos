@@ -1,0 +1,15 @@
+build/
+dist/
+.DS_Store
+*.rom
+*.ROM
+.env
+.env.*
+!.env.example
+*.prc
+*.pdb
+*.o
+*.elf
+*.map
+__pycache__/
+*.pyc
