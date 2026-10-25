@@ -5,6 +5,30 @@ static Char titles[MOSS_MAX_CHATS][40];
 static Char *titlePointers[MOSS_MAX_CHATS];
 static UInt16 chatRecords[MOSS_MAX_CHATS],chatCount;
 static Boolean stopping=false, clearKey=false;
+/* FrmSetTitle retains this pointer. Reserve the right 62 pixels for navigation. */
+static void asciiDisplay(Char *s);
+static Char chatTitle[40];
+static void setChatTitle(FormType *f) {
+ FontID old; UInt16 len;
+ StrNCopy(chatTitle,gConversation.title,15); chatTitle[15]=0;
+ asciiDisplay(chatTitle);
+ old=FntSetFont(boldFont); len=StrLen(chatTitle);
+ while(len && FntCharsWidth(chatTitle,len)>88) chatTitle[--len]=0;
+ FntSetFont(old); FrmSetTitle(f,chatTitle);
+}
+static void drawPage(UInt16 current,UInt16 total) {
+ Char page[16],num[8]; RectangleType r; FontID old; Int16 i;
+ r.topLeft.x=111; r.topLeft.y=1; r.extent.x=35; r.extent.y=12;
+ StrIToA(page,current); StrCat(page,"/"); StrIToA(num,total); StrCat(page,num);
+ old=FntSetFont(stdFont); WinEraseRectangle(&r,0);
+ WinDrawChars(page,StrLen(page),111+(35-FntCharsWidth(page,StrLen(page)))/2,1);
+ FntSetFont(old);
+ /* Solid arrows match Date Book's title-bar navigation. */
+ for(i=0;i<4;++i) {
+  WinDrawLine(102+i,6-i,102+i,6+i);
+  WinDrawLine(154-i,6-i,154-i,6+i);
+ }
+}
 static FieldType *field(UInt16 id) {
  FormType *f=FrmGetActiveForm(); UInt16 i=FrmGetObjectIndex(f,id);
  return i==frmInvalidObjectId ? NULL : FrmGetObjectPtr(f,i);
@@ -41,18 +65,18 @@ void AppAlert(const Char *s) { FrmCustomAlert(ALERT_INFO,s,"",""); }
 void AppStatus(const Char *s) {
  FormType *f=FrmGetActiveForm(); RectangleType r; UInt16 i;
  if(!f || FrmGetFormId(f)!=FORM_CHAT) return;
- r.topLeft.x=73; r.topLeft.y=94; r.extent.x=86; r.extent.y=12;
- WinEraseRectangle(&r,0); WinDrawChars(s,StrLen(s),74,95);
+ r.topLeft.x=3; r.topLeft.y=94; r.extent.x=154; r.extent.y=12;
+ WinEraseRectangle(&r,0); WinDrawChars(s,StrLen(s),3,95);
  i=FrmGetObjectIndex(f,BUTTON_SEND);
  CtlSetLabel(FrmGetObjectPtr(f,i),NetBusy()?"Cancel":"Send");
 }
 static void showMessage(void) {
- Char *buf; Char prefix[80],num[16]; MossMessageHeader h; unsigned offset;
+ Char *buf; Char prefix[80]; MossMessageHeader h; unsigned offset;
+ if(gMessageCount && showing>=gMessageCount) showing=gMessageCount-1;
+ drawPage(gMessageCount?showing+1:0,gMessageCount);
  if(!gMessageCount) { setText(FIELD_REPLY,"Welcome to Moss.\n\nSet your API in Chat > API settings.\nEnglish / ASCII input in this build."); FldSetScrollPosition(field(FIELD_REPLY),0); updateReplyScroll(); return; }
- if(showing>=gMessageCount) showing=gMessageCount-1;
  buf=MemPtrNew(MOSS_REPLY_MAX+160); if(!buf) return;
- StrCopy(prefix,""); StrIToA(num,showing+1); StrCat(prefix,num); StrCat(prefix,"/");
- StrIToA(num,gMessageCount); StrCat(prefix,num); StrCat(prefix,"  ");
+ StrCopy(prefix,"");
  if(!StoreRead(gMessages[showing],&h,buf+80,MOSS_REPLY_MAX+64)) { MemPtrFree(buf); return; }
  StrCat(prefix,h.assistant?"AI":"You");
  if(h.state==MSG_FAILED) StrCat(prefix," [Retry available]");
@@ -66,7 +90,7 @@ void AppRefresh(void) {
  FormType *f=FrmGetActiveForm(); MossMessageHeader h; Char tiny[2];
  if(!f || FrmGetFormId(f)!=FORM_CHAT) return;
  showing=gMessageCount?gMessageCount-1:0;
- FrmSetTitle(f,gConversation.title); showMessage();
+ setChatTitle(f); showMessage();
  if(gMessageCount && StoreRead(gMessages[showing],&h,tiny,sizeof(tiny)) && h.assistant && h.state==MSG_OK)
   replyToEnd();
  FldDrawField(field(FIELD_REPLY)); AppStatus(NetBusy()?"Working":"Ready");
@@ -79,6 +103,7 @@ void AppStream(const Char *answer) {
  StrCopy(buf,"AI [Streaming]\n\n"); StrCat(buf,answer); asciiDisplay(buf);
  setText(FIELD_REPLY,buf); MemPtrFree(buf); FldSetScrollPosition(reply,0);
  replyToEnd(); FldDrawField(reply);
+ drawPage(gMessageCount+1,gMessageCount+1);
  AppStatus("Receiving");
 }
 static Boolean saveDraft(void) {
@@ -147,10 +172,13 @@ static Boolean menu(UInt16 id) {
  return false;
 }
 static Boolean chatEvent(EventType *e) {
+ if(e->eType==frmUpdateEvent) {
+  FrmDrawForm(FrmGetActiveForm()); drawPage(gMessageCount?showing+1:0,gMessageCount); return true;
+ }
  if(e->eType==frmOpenEvent) {
-  FormType *f=FrmGetActiveForm(); displayedConversation=gConversation.id; FrmSetTitle(f,gConversation.title);
+  FormType *f=FrmGetActiveForm(); displayedConversation=gConversation.id; setChatTitle(f);
   showing=gMessageCount?gMessageCount-1:0; showMessage(); setText(FIELD_INPUT,gConversation.draft);
-  FrmDrawForm(f); AppStatus("Ready"); FrmSetFocus(f,FrmGetObjectIndex(f,FIELD_INPUT)); return true;
+  FrmDrawForm(f); drawPage(gMessageCount?showing+1:0,gMessageCount); AppStatus("Ready"); FrmSetFocus(f,FrmGetObjectIndex(f,FIELD_INPUT)); return true;
  }
  if(e->eType==frmCloseEvent) { saveDraft(); return false; }
  if(e->eType==fldChangedEvent && e->data.fldChanged.fieldID==FIELD_INPUT) { saveDraft(); return false; }
