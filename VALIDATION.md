@@ -2,13 +2,67 @@
 
 日期：2026-10-25（Asia/Shanghai）
 
-## 当前实验版验收
+## 当前模拟器操作方式
+
+本地启动、安装与界面操作统一使用 Palm OS MCP，步骤见 [README.md](README.md#构建与运行)。已验证实例查询、加载 OS 3.1 ROM、等待就绪、截图、点击完成 Setup 并保存会话；本次 MCP 检查未安装 Moss，也未调用 AI 服务。下文历史记录中的 `run.sh`、CLI 和工具栏操作仅描述当时的验证方式。
+
+## 当前补充：长回答滚动及标点兼容
+
+- 回答区增加可拖动滚动条，硬件键按可见行数翻页并同步位置；按最新要求，流式每次新增内容都强制滚动到底部，回答完成并保存后也停留在末尾。
+- 在 Palm IIIx / OS 3.1 上用已有长回答验证：可拖至故事最后一句，硬件向上键能返回前页，原有对话保留。本项未新增 AI 调用。
+- 显示转换将 Unicode 弯引号、破折号、省略号、不换行空格等转换成 ASCII 标点；数据库及请求上下文仍使用原始 UTF-8。仍未提供完整 Unicode 字体。
+- 安装后在原有故事回答中确认 `He's out back. Go talk to him.` 的单引号及外围双引号正常显示，无需重新调用模型。
+- 全套本机检查通过，包含新增标点、ASCII 原样保留、中文/emoji 回退和不完整 UTF-8 的 ASan/UBSan 检查，以及 20 项代理测试。
+- Windows 7 / GCC 2.95.2 / SDK 3.5 构建并安装：`dist/Moss.prc` 21350 字节，SHA-256 `6ab9b647661df744a6448b9bd58dda98bdc3b1d91dfcca2b0dc394412ffce6b3`。该最终滚动策略通过远程编译；前述全套本机测试针对标点修复运行，协议和网络逻辑未再修改。
+
+## 当前：纯文本 HTTP 增量流版本
+
+- Windows 7 / GCC 2.95.2 / SDK 3.5 远程构建成功，`dist/Moss.prc` 20600 字节，SHA-256 `bbcff2e1bac2c6058d4550e90260ab1749c97b138a8138dd5f56692ba3ff3afe`。已安装到 Palm IIIx / OS 3.1 模拟器。
+- Palm 发送 `stream: true` 和 `Accept: text/plain`。代理解析上游 SSE，只将 UTF-8 文字增量作为 HTTP chunked 正文立即返回；下游不包含 SSE/JSON 事件。代理确认上游结束标记及 HTTP 完整结束后才发送终止 chunk。
+- Palm 收到正文即更新 `AI [Streaming]`，后续刷新约限为每秒 10 次；UTF-8 可跨 TCP 包和 HTTP chunk。回答前缀上限 4096 字节，超出继续排空，协议状态在本机 ABI 下为 5432 字节（不是整个应用堆占用或 Palm ABI 实测值），无需完整 HTTP/SSE/JSON 缓冲。
+- 本地协议、增量正文、实际 Palm 网络状态机通过 ASan/UBSan，覆盖分包、UTF-8、超长截断、提前显示、复用、取消及异常不保存、不自动重放。
+- 代理 20 项测试通过，包含受控等待点确认首段在上游结束前到达、纯文本输出、SSE 分片/Unicode、JSON 回退、缺失 DONE/错误事件/中途断开时下游 HTTP 不完整，以及既有鉴权、路由、复用和证书拒绝检查。这些测试只使用本机临时服务。
+- 本地 mock 界面验收：延迟 SSE 上游 `8766` 经代理 `8767` 转成纯文本；发送 `Plain HTTP streaming demo` 后，Palm 在 `Receiving` / Cancel 状态先显示 `Mock`，结束后保存 `2/2 AI`、完整 mock 文本及 `Context messages: 1`。这不是 AI 服务调用。
+- 已恢复 `http://127.0.0.1:8765/v1` / `deepseek-flash`，并重启真实代理加载新协议。新空会话连续发送两轮已授权的 `Reply with exactly OK.`，真实 DeepSeek 分别返回 `2/2 AI` / `OK`、`4/4 AI` / `OK`，第二轮显示 `Ready (reused)`。服务 Key 仅在代理进程环境中，未进入源码。
+- Python 语法、Git whitespace、源码凭据模式扫描通过。未做实体设备、OS 4.0 或精确带宽/延迟基准，不报告提速比例。
+
+## 历史：HTTP 中间代理非流式版本
+
+用户选择放弃 Palm 端 TLS，改用中间代理。当前 `./build.sh` 仅远程编译 `Moss.prc`，`./run.sh` 仅安装该应用；`tls/`、BearSSL 与历史测试保留源码，不再构成当前运行依赖。旧库和种子数据库未删除、未覆盖。
+
+- 构建：Windows 7 / GCC 2.95.2 / SDK 3.5，`dist/Moss.prc` 20396 字节，SHA-256 `fb562787e082a6701fa238a6cfc3be17db31a3196524ade60365a4fbf1ec67c9`。
+- Palm IIIx / OS 3.1 安装启动成功，已有用户会话保留。设置改为 `http://127.0.0.1:8765/v1`、模型 `deepseek-flash`，清除 Palm 上原服务 Key；实际服务 Key 仅在本机代理进程环境内，未写入源码。
+- 新空会话两轮真实服务调用成功：分别发送 `Reply with exactly OK.`，显示 `2/2 AI` / `OK` 和 `4/4 AI` / `OK`，第二轮显示 `Ready (reused)`。代理日志记录两次 HTTP 200，无聊天正文或凭据。此结果是经代理调用真实 DeepSeek，区别于本地 mock，也不再声称 Palm 独立 TLS。
+- 两轮真实网络检查使用与最终版相同的网络代码；最终仅把 About 页说明由 native TLS 改为 HTTP relay，并重新远程编译安装。
+- 本地协议及实际 Palm 网络状态机通过 ASan/UBSan；HTTP 复用、空闲超时、地址变化、发送后不重放、取消释放与拒绝直接 HTTPS 的分支通过。
+- 代理 12 项集成测试通过：转发及路径前缀、独立鉴权、固定路由、非流式限制、容量上限、客户端及上游 TCP 复用、失败 POST 不重放、重定向拒绝、HTTP 错误状态保留、压缩响应拒绝、重复 Content-Length 拒绝、拒绝本地不受信任 HTTPS 证书且服务端收到零个 HTTP 请求。
+- 代理上游通过 Python `ssl.create_default_context()` 校验证书及主机名；不受 Palm 历史 TLS 套件限制。Palm 到代理为明文 HTTP。
+- Shell 和 Python 语法检查、Git whitespace 检查通过。代理测试只使用本机临时 HTTP/HTTPS 服务，不调用 AI。
+- 尚未验收实体设备、局域网代理部署或本版 OS 4.0 收发。未进行精确延迟基准测试，不报告提速比例。
+
+以下为历史 Palm 原生 TLS 版本及早期 mock 的记录，不代表当前部署架构。
+
+## 历史：原生 TLS 连接复用版本
+
+- Windows 7 / GCC 2.95.2 构建成功：`dist/Moss.prc`，22270 字节，SHA-256 `626d85299a430b4e108fd31095bc4949c686b3cfbab25c08d50f44e936d39292`。实验 TLS 库未改动，哈希与下节相同。
+- 已在 Palm IIIx / OS 3.1 覆盖安装最终构建，启动正常；此前四条测试记录及草稿保留。
+- 成功且明确分帧的响应后保留同来源 HTTP/TLS 连接 60 秒；退出、取消、设置保存、超时、失败时释放。保留会话导致低内存时退回新连接。
+- `./tests/run.sh` 通过，含协议 ASan/UBSan、网络状态机 ASan/UBSan 和 36 组双路径 RSA 参考向量。
+- 协议新增持久连接检查：HTTP/1.0 显式许可、HTTP/1.1 默认许可、大小写和逗号分隔的 Connection 头、重复头中 close 优先、chunked 与 trailer、截断与多余字节、依赖 EOF 的响应不复用。
+- 网络测试运行实际 `src/network.c`，使用确定性的模拟 Palm/HTTP/TLS 传输，确认两次回复只连接/建会话一次、失效后发送前重连、发送后失败不自动重放、空闲释放、取消释放、域名/协议/端口变化和低内存回退。它不构成真实 TLS 或 AI 请求验收。
+- 低内存回退修订前的 22186 字节构建已在 Palm 上取得两轮真实 DeepSeek `OK`；第二轮因操作延迟超过空闲窗口，实际重新握手，不能算复用成功。
+- 最终 60 秒版本已完成 Palm IIIx / OS 3.1 真实连续复用验收：新建空会话，向 `https://api.deepseek.com/v1` / `deepseek-flash` 连续发送两次 `Reply with exactly OK.`。首轮显示 `2/2 AI` / `OK`，次轮显示 `4/4 AI` / `OK` 和 `Ready (dev reuse)`，确认沿用同一 TLS 会话，未重新握手。
+- 两轮发送起点间隔约 35 秒；第二轮发送后约 15 秒观察时已完成。这些是 UI 观察时间，不是精确延迟或提速比例。原 15 秒版本在发送间隔约 31 秒时超出保留窗口而重新连接，因此将窗口调整为 60 秒。
+- UI 自动审批最初因无法核实目标与历史拒绝提交；用户随后明确授权指定的两轮测试内容，验收已完成。未向原有用户会话插入测试消息。
+- OS 4.0、实体设备及默认验证库的真实连接复用尚未验收。
+
+## 此前跳过验签实验版验收
 
 用户明确选择跳过证书校验。`MOSS_TLS_INSECURE=1 ./build.sh` 已在 Windows 7 构建，并通过 `MOSS_TLS_PRC="$PWD/dist/MossTLS-insecure.prc" ./run.sh` 安装到 Palm IIIx / OS 3.1。
 
 新建空会话，核对目标为 `https://api.deepseek.com/v1`、模型 `deepseek-flash` 后发送 `Reply with exactly OK.`，实际显示 `2/2 AI`、`OK` 及 `Ready (TLS dev)`。发送后约 15 秒观察时已完成；此数值是观察上界，不是精确响应耗时。原有用户会话未发送测试消息。
 
-- 当前应用：`dist/Moss.prc`，20846 字节，SHA-256 `d1b69f49989c58f1a2d241f231183fc8e3de19b94124d035c3ae4b8df0263c27`。
+- 此前应用：`dist/Moss.prc`，20846 字节，SHA-256 `d1b69f49989c58f1a2d241f231183fc8e3de19b94124d035c3ae4b8df0263c27`。
 - 实验库：`dist/MossTLS-insecure.prc`，49114 字节，SHA-256 `7a58dea779a616811ca9462facd0417394ec940f0ed9f1577f43d09e1e47e69e`。
 - 保留的默认验证库：`dist/MossTLS.prc`，49182 字节，SHA-256 `bb53ebc10cae321fd6dfa06c838a9346cb129da3def7e2eb44778666c7c1a3e4`。
 - 实验版保留 Palm 端 TLS 加密，跳过证书链、域名及有效期验证；没有 TLS 终止代理。状态位明确标记实验模式，不报告 X.509 验证成功。

@@ -44,7 +44,9 @@ void NetStart(UInt16 questionRecord);
 void NetPump(void);
 void NetCancel(void);
 Boolean NetBusy(void);
+Boolean NetConnected(void);
 void AppStatus(const Char *text);
 void AppRefresh(void);
+void AppStream(const Char *answer);
 void AppAlert(const Char *text);
 #endif

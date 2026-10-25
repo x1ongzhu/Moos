@@ -18,12 +18,24 @@ static void setText(UInt16 id,const Char *s) {
  old=FldGetTextHandle(f); FldSetTextHandle(f,h); if(old) MemHandleFree(old);
 }
 static void asciiDisplay(Char *s) {
- Char *p=s,*out=s;
- while(*p) {
-  if((UInt8)*p<128) *out++=*p++;
-  else { *out++='?'; ++p; while(((UInt8)*p&0xc0)==0x80) ++p; }
- }
- *out=0;
+ moss_display_ascii(s);
+}
+static void updateReplyScroll(void) {
+ FormType *f=FrmGetActiveForm(); UInt16 pos,height,visible,max;
+ FldGetScrollValues(field(FIELD_REPLY),&pos,&height,&visible);
+ max=height>visible?height-visible:0;
+ if(pos>max) max=pos;
+ SclSetScrollBar(FrmGetObjectPtr(f,FrmGetObjectIndex(f,SCROLL_REPLY)),pos,0,max,visible>1?visible-1:1);
+}
+static void scrollReply(Int16 lines) {
+ FieldType *reply=field(FIELD_REPLY);
+ FldScrollField(reply,lines<0?-lines:lines,lines<0?winUp:winDown);
+ updateReplyScroll();
+}
+static void replyToEnd(void) {
+ FieldType *reply=field(FIELD_REPLY); UInt16 pos,height,visible;
+ FldGetScrollValues(reply,&pos,&height,&visible);
+ FldScrollField(reply,height,winDown); updateReplyScroll();
 }
 void AppAlert(const Char *s) { FrmCustomAlert(ALERT_INFO,s,"",""); }
 void AppStatus(const Char *s) {
@@ -36,7 +48,7 @@ void AppStatus(const Char *s) {
 }
 static void showMessage(void) {
  Char *buf; Char prefix[80],num[16]; MossMessageHeader h; unsigned offset;
- if(!gMessageCount) { setText(FIELD_REPLY,"Welcome to Moss.\n\nSet your API in Chat > API settings.\nEnglish / ASCII input in this build."); return; }
+ if(!gMessageCount) { setText(FIELD_REPLY,"Welcome to Moss.\n\nSet your API in Chat > API settings.\nEnglish / ASCII input in this build."); FldSetScrollPosition(field(FIELD_REPLY),0); updateReplyScroll(); return; }
  if(showing>=gMessageCount) showing=gMessageCount-1;
  buf=MemPtrNew(MOSS_REPLY_MAX+160); if(!buf) return;
  StrCopy(prefix,""); StrIToA(num,showing+1); StrCat(prefix,num); StrCat(prefix,"/");
@@ -48,13 +60,26 @@ static void showMessage(void) {
  StrCat(prefix,"\n\n"); offset=StrLen(prefix);
  MemMove(buf+offset,buf+80,StrLen(buf+80)+1); MemMove(buf,prefix,offset);
  asciiDisplay(buf); setText(FIELD_REPLY,buf); MemPtrFree(buf);
+ FldSetScrollPosition(field(FIELD_REPLY),0); updateReplyScroll();
 }
 void AppRefresh(void) {
- FormType *f=FrmGetActiveForm();
+ FormType *f=FrmGetActiveForm(); MossMessageHeader h; Char tiny[2];
  if(!f || FrmGetFormId(f)!=FORM_CHAT) return;
  showing=gMessageCount?gMessageCount-1:0;
  FrmSetTitle(f,gConversation.title); showMessage();
+ if(gMessageCount && StoreRead(gMessages[showing],&h,tiny,sizeof(tiny)) && h.assistant && h.state==MSG_OK)
+  replyToEnd();
  FldDrawField(field(FIELD_REPLY)); AppStatus(NetBusy()?"Working":"Ready");
+}
+void AppStream(const Char *answer) {
+ Char *buf; FormType *f=FrmGetActiveForm(); FieldType *reply;
+ if(!f || FrmGetFormId(f)!=FORM_CHAT) return;
+ reply=field(FIELD_REPLY);
+ buf=MemPtrNew(MOSS_REPLY_MAX+80); if(!buf) return;
+ StrCopy(buf,"AI [Streaming]\n\n"); StrCat(buf,answer); asciiDisplay(buf);
+ setText(FIELD_REPLY,buf); MemPtrFree(buf); FldSetScrollPosition(reply,0);
+ replyToEnd(); FldDrawField(reply);
+ AppStatus("Receiving");
 }
 static Boolean saveDraft(void) {
  const Char *s;
@@ -117,7 +142,7 @@ static Boolean menu(UInt16 id) {
  case MENU_DELETE:
   if(FrmAlert(ALERT_DELETE)==0) { if(StoreDelete()) FrmGotoForm(FORM_CHAT); else AppAlert("Could not delete chat."); }
   return true;
- case MENU_ABOUT: AppAlert("Moss 0.1.0\nPalm OS 3.1+\nOpenAI-compatible text chat.\nASCII display; native TLS library."); return true;
+ case MENU_ABOUT: AppAlert("Moss 0.1.0\nPalm OS 3.1+\nOpenAI-compatible text chat.\nASCII display; HTTP relay client."); return true;
  }
  return false;
 }
@@ -129,8 +154,13 @@ static Boolean chatEvent(EventType *e) {
  }
  if(e->eType==frmCloseEvent) { saveDraft(); return false; }
  if(e->eType==fldChangedEvent && e->data.fldChanged.fieldID==FIELD_INPUT) { saveDraft(); return false; }
+ if(e->eType==sclRepeatEvent && e->data.sclRepeat.scrollBarID==SCROLL_REPLY) {
+  scrollReply(e->data.sclRepeat.newValue-e->data.sclRepeat.value); return false;
+ }
  if(e->eType==keyDownEvent && (e->data.keyDown.chr==vchrPageUp || e->data.keyDown.chr==vchrPageDown)) {
-  FldScrollField(field(FIELD_REPLY),6,e->data.keyDown.chr==vchrPageUp?winUp:winDown); return true;
+  UInt16 pos,height,visible;
+  FldGetScrollValues(field(FIELD_REPLY),&pos,&height,&visible);
+  scrollReply((e->data.keyDown.chr==vchrPageUp?-1:1)*(visible>1?visible-1:1)); return true;
  }
  if(e->eType==ctlSelectEvent) {
   UInt16 id=e->data.ctlSelect.controlID;
@@ -160,8 +190,9 @@ static Boolean settingsEvent(EventType *e) {
   if(id==BUTTON_CANCEL) { FrmGotoForm(FORM_CHAT); return true; }
   if(id==BUTTON_SAVE) {
    MossURL url; Char key[192];
-   if(!moss_url(text(FIELD_URL),&url)) { AppAlert("Invalid Base URL. Use http://host:port/v1 or https://host/v1."); return true; }
+   if(!moss_url(text(FIELD_URL),&url) || url.tls) { AppAlert("Use an HTTP relay URL, for example http://127.0.0.1:8765/v1."); return true; }
    if(!*text(FIELD_MODEL)) { AppAlert("Enter a model ID."); return true; }
+   NetCancel(); /* Release idle connection when API settings change. */
    StrCopy(gPrefs.url,text(FIELD_URL)); StrCopy(gPrefs.model,text(FIELD_MODEL));
    if(clearKey) gPrefs.key[0]=0;
    if(*text(FIELD_KEY)) StrCopy(gPrefs.key,text(FIELD_KEY));
@@ -215,7 +246,7 @@ UInt32 PilotMain(UInt16 cmd,MemPtr cmdPBP,UInt16 launchFlags) {
  if(!StoreOpen()) { AppAlert("Cannot open Moss databases. Check free storage."); StoreClose(); return 1; }
  FrmGotoForm(FORM_CHAT);
  while(!stopping) {
-  EvtGetEvent(&event,NetBusy()?2:evtWaitForever);
+  EvtGetEvent(&event,NetBusy()?2:(NetConnected()?SysTicksPerSecond():evtWaitForever));
   if(event.eType==appStopEvent) { NetCancel(); saveDraft(); stopping=true; continue; }
   if(!SysHandleEvent(&event) && !MenuHandleEvent(NULL,&event,&error) && !appEvent(&event)) FrmDispatchEvent(&event);
   NetPump();

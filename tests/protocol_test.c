@@ -24,7 +24,9 @@ static void requests(void) {
  assert(strstr(request,"\\\" and \\\\ and\\u000anewline"));
  body=strstr(request,"\r\n\r\n")+4; length=strstr(request,"Content-Length: ");
  assert(sscanf(length,"Content-Length: %u",&expected)==1 && expected==strlen(body));
- assert(strstr(body,"\"stream\":false"));
+ assert(strstr(body,"\"stream\":true"));
+ assert(strstr(request,"Accept: text/plain\r\n"));
+ assert(strstr(request,"Connection: keep-alive\r\n"));
  assert(moss_request(small,sizeof(small),&u,"","m",m,2)<0);
  assert(moss_request(request,sizeof(request),&u,"bad\r\nKey","m",m,2)<0);
 }
@@ -53,17 +55,34 @@ static void framing(void) {
  strcpy(wire,"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nOKxx");
  assert(moss_http_complete(wire,strlen(wire),0)==-1);
 }
-static void replies(void) {
- char out[256],small[4]; int truncated;
- const char *json="{\"usage\":{\"nested\":[1,true,null]},\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"Hi\\n\\u4f60\\u597d \\ud83d\\ude00\"}}]}";
- assert(moss_reply(json,out,sizeof(out),&truncated)>0);
- assert(!strcmp(out,"Hi\n\xe4\xbd\xa0\xe5\xa5\xbd \xf0\x9f\x98\x80") && !truncated);
- assert(moss_reply(json,small,sizeof(small),&truncated)==3 && truncated && !strcmp(small,"Hi\n"));
- assert(moss_reply("{\"choices\":[{\"message\":{\"content\":null}}]}",out,sizeof(out),&truncated)<0);
- assert(moss_reply("{\"choices\":[{\"message\":{\"content\":\"\\ud800\"}}]}",out,sizeof(out),&truncated)<0);
- assert(moss_reply("{\"choices\":[{\"message\":{\"content\":\"\\u0000\"}}]}",out,sizeof(out),&truncated)<0);
- assert(moss_reply("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}garbage",out,sizeof(out),&truncated)<0);
- assert(moss_reply("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]",out,sizeof(out),&truncated)<0);
- assert(moss_error("{\"error\":{\"message\":\"Bad key\"}}",out,sizeof(out))==7 && !strcmp(out,"Bad key"));
+static void persistence(void) {
+ const char *cases[]={
+  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+  "HTTP/1.1 200 OK\r\nConnection: upgrade, ClOsE\r\nContent-Length: 2\r\n\r\nOK",
+  "HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK",
+  "HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 2\r\n\r\nOK",
+  "HTTP/1.1 200 OK\r\nConnection: close\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK",
+  "HTTP/1.1 200 OK\r\n\r\nOK",
+  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOKEXTRA",
+  "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nO",
+  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nOK\r\n0\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nOK\r\n0\r\nX-Test: yes\r\n\r\n",
+  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nOK\r\n0\r\n\r\nEXTRA"
+ };
+ int expected[]={1,0,0,1,0,0,0,0,1,1,0}; unsigned i;
+ for(i=0;i<sizeof(cases)/sizeof(cases[0]);++i)
+  assert(moss_http_reusable(cases[i],strlen(cases[i]))==expected[i]);
 }
-int main(void) { urls(); requests(); framing(); replies(); puts("Protocol checks passed"); return 0; }
+static void display_text(void) {
+ char sample[]="It\xe2\x80\x99s \xe2\x80\x9cgood\xe2\x80\x9d\xe2\x80\x94really\xe2\x80\xa6";
+ char plain[]="It's \"good\" - really...";
+ char other[]="\xe4\xbd\xa0\xe5\xa5\xbd \xf0\x9f\x98\x80";
+ char spaces[]="a\xc2\xa0" "b\xe2\x80\xaf" "c\xe2\x80\xa2";
+ char broken[]="end\xe2\x80";
+ moss_display_ascii(sample); assert(!strcmp(sample,"It's \"good\"-really..."));
+ moss_display_ascii(plain); assert(!strcmp(plain,"It's \"good\" - really..."));
+ moss_display_ascii(other); assert(!strcmp(other,"?? ?"));
+ moss_display_ascii(spaces); assert(!strcmp(spaces,"a b c*"));
+ moss_display_ascii(broken); assert(!strcmp(broken,"end?"));
+}
+int main(void) { urls(); requests(); framing(); persistence(); display_text(); puts("Protocol checks passed"); return 0; }

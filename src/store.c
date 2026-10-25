@@ -18,7 +18,7 @@ Boolean StoreOpen(void) {
  version=PrefGetAppPreferences(MOSS_CREATOR,0,&gPrefs,&size,true);
  if(version!=1 || size!=sizeof(gPrefs)) {
   MemSet(&gPrefs,sizeof(gPrefs),0); gPrefs.version=1;
-  StrCopy(gPrefs.url,"https://api.deepseek.com/v1");
+  StrCopy(gPrefs.url,"http://127.0.0.1:8765/v1");
  }
  gPrefs.url[192]=0; gPrefs.model[63]=0; gPrefs.key[191]=0;
  /* Optional one-shot configuration import. Keys stay in RAM unless user opts in. */

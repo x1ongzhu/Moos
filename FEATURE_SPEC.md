@@ -2,11 +2,11 @@
 
 **版本：** 0.3（产品讨论稿）  
 **目标平台：** Palm OS 3.1–4.0，68K 设备  
-**产品形态：** Palm PRC 纯文本客户端，通过 OpenAI 兼容 API 交互；独立 TLS 共享库直连 HTTPS
+**产品形态：** Palm PRC 纯文本客户端，通过 OpenAI 兼容 API 交互；HTTP 中间代理连接 HTTPS 服务
 
 ## 1. 产品概述
 
-为 Palm OS 老设备提供轻量文字 AI 对话。客户端负责输入、显示、保存和连接管理，通过 OpenAI 兼容 API 调用用户指定的模型服务。AI 推理由服务端完成；设备通过独立的 TLS Library PRC 直连 HTTPS。目标是在小屏、低内存、间歇连接和 Graffiti 输入条件下，让用户能够发起问题、阅读短回答并继续追问。
+为 Palm OS 老设备提供轻量文字 AI 对话。客户端负责输入、显示、保存和连接管理，通过 OpenAI 兼容 API 调用用户指定的模型服务。AI 推理由服务端完成；设备通过 HTTP 连接中间代理，由代理处理上游 HTTPS。目标是在小屏、低内存、间歇连接和 Graffiti 输入条件下，让用户能够发起问题、阅读短回答并继续追问。
 
 ### 产品目标
 
@@ -23,9 +23,9 @@
 
 ### 首版实现建议
 
-- 使用非流式回答，完成接收后显示；流式输出尚未作为用户确认需求。
+- 代理把上游 SSE 转成纯文本 HTTP 流，Palm 收到正文就逐段显示；完整结束后保存，取消或中断的片段不进入上下文。
 - 使用原生 Palm 界面显示文本。
-- TLS 1.2 在独立 Library PRC 内实现，并在目标 ROM 与实际服务上验证。
+- Palm 只处理 HTTP；代理使用主机 TLS 与证书库连接上游 HTTPS。
 
 ## 2. 用户与典型场景
 
@@ -107,7 +107,7 @@
 
 ### 核心配置
 
-- `Base URL`：服务基础地址，允许包含路径前缀，例如 `https://example.com/v1`。
+- `Base URL`：服务基础地址，允许包含路径前缀，例如 `http://relay-host:8765/v1`。
 - `API Key`：按服务要求配置，默认遮蔽显示；允许不需要 Key 的服务留空。
 - `Model`：可手动填写服务提供的模型 ID，不硬编码模型名称，不强制依赖模型列表接口。
 - 超时、上下文预算、本地文本容量和可选的服务端输出 token 上限分别设置；字符数与 token 数不视为等价。
@@ -115,9 +115,9 @@
 ### 最小请求与响应
 
 - 请求：向 Base URL 追加 `/chat/completions` 后发送 POST；例如上述地址得到 `/v1/chat/completions`。
-- JSON 请求至少包含 `model`、文字 `messages` 和 `stream: false`；消息角色以 `user`、`assistant` 为基础。可选系统提示词须按目标服务与模型支持情况启用。
+- JSON 请求至少包含 `model`、文字 `messages` 和 `stream: true`；消息角色以 `user`、`assistant` 为基础。Palm 请求使用 `Accept: text/plain`；代理解析上游 `choices[].delta.content`，立即输出纯文本 HTTP chunk，不下发 SSE/JSON 元数据。代理确认 `[DONE]` 和完整上游 HTTP 结束后发送终止 chunk，Palm 以完整 HTTP 分帧确认结束。可选系统提示词须按目标服务与模型支持情况启用。
 - 使用 `Content-Type: application/json`；配置 Key 时按服务要求使用 `Authorization: Bearer <API Key>`。
-- 读取 `choices[0].message.content` 作为回答，并处理 `finish_reason`；`usage` 等附加字段可忽略。缺少有效文字回答时提示不支持的响应格式。
+- 服务返回非流式 JSON 时，由代理读取 `choices[0].message.content` 并转成纯文本；Palm 无需解析 JSON。流式 `usage` 等附加字段由代理过滤，缺少有效文字回答时提示错误。
 - 会话 ID、标题和本地消息状态由客户端维护；每次请求显式携带选定的历史上下文，不依赖服务端保存会话。
 - 输出 token 限制参数按服务兼容性配置：不假设所有服务或模型都接受同一个参数；无法设置时仍执行客户端容量限制。
 - 本地容量超限时保留可用文本并标识截断。客户端截断不保证减少服务端生成量或费用。
@@ -125,12 +125,13 @@
 
 接口字段参考 [OpenAI Chat Completions 官方文档](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。第三方兼容服务的实际支持范围需单独验证。
 
-### HTTPS 与共享库
+### 中间代理
 
-- 直接连接 HTTPS API，不使用转发代理；TLS 在 Palm 68K 端完成。
-- TLS 实现为独立 `MossTLS.prc`，提供会话创建、握手推进、读写与销毁接口，供其他应用复用。
-- 校验证书链、域名及有效期；协议和信任根的覆盖范围需明确列出。
-- 初始随机种子按设备独立提供，后续由库持久化更新；退出后不后台常驻。
+- Palm 通过 HTTP 访问固定的 OpenAI 兼容 Chat Completions 代理。
+- 代理负责上游 HTTPS、证书链/域名校验及服务 Key；Palm 可使用独立代理口令。
+- 两端复用连接；请求发送后失败不自动重放，避免重复模型调用。
+- 默认仅监听本机回环地址；实体设备填写可达的代理主机地址。Palm 到代理的 HTTP 不加密。
+- 历史 Palm TLS 实验保留源码，但默认只构建和安装 `Moss.prc`。
 
 ### 已确认的开发环境
 
@@ -139,8 +140,7 @@
 | 源码开发与编辑 | 本地 macOS，项目目录 `/Users/drew/workspace/palmos/Moss` |
 | 编译构建 | 远程 Windows 7 机器，通过 SSH 登录 `drew@192.168.50.167` |
 | 产物回收 | 构建完成后，将 PRC 和构建日志取回本地；可通过 SCP/SFTP 传输 |
-| 本地运行 | Palm OS 模拟器 `/Applications/Palm OS.app` |
-| 模拟器可执行文件 | `/Applications/Palm OS.app/Contents/MacOS/CloudpilotMac` |
+| 本地运行与验收 | Palm OS MCP（`palmos`），负责模拟器启动、安装、截图与交互 |
 
 ### 标准开发流程
 
@@ -148,7 +148,7 @@
 2. 将当前构建所需文件传输到远程机器的项目工作目录。
 3. 通过 SSH 在 Windows 7 上执行远程工具链的构建命令，记录退出状态和构建日志。
 4. 构建成功后取回本次生成的 PRC；构建失败时取回日志供本地修正。避免将旧 PRC 当成本次构建结果。
-5. 在本地选择目标 Palm OS ROM，使用取回的 PRC 启动模拟器。
+5. 通过 Palm OS MCP 选择或启动目标 ROM 的实例，等待系统就绪后安装取回的 PRC；首次启动先完成 Setup。
 6. 根据运行结果继续在本地修改，再重复远程构建与本地运行流程。
 
 SSH 登录入口：
@@ -157,20 +157,15 @@ SSH 登录入口：
 ssh drew@192.168.50.167
 ```
 
-本地模拟器启动命令（`ROM_FILE` 和 `PRC_FILE` 替换为实际路径）：
+本地模拟器统一使用 Palm OS MCP，不直接调用 App 可执行文件或 `run.sh`：先用 `palm_list_instances` 查找并复用已有会话；需要新实例时用 `palm_open_emulator` 指定 ROM 绝对路径。安装前调用 `palm_wait_ready`，用 `palm_set_network` 启用原生网络重定向，再通过 `palm_install` 安装本地 `dist/Moss.prc` 的绝对路径。多个窗口时显式指定 `instance_id`。
 
-```sh
-"/Applications/Palm OS.app/Contents/MacOS/CloudpilotMac" \
-  --rom "ROM_FILE" \
-  --install "PRC_FILE" \
-  --reset
-```
+使用 `palm_screenshot`、`palm_tap`、`palm_type_text` 和 `palm_press_key` 完成 Setup、配置与界面验收，最后调用 `palm_save`。完整调用顺序与参数示例见 [README.md](README.md#构建与运行)。
 
 ### 构建流程配置与验证
 
 - 已落实：远程默认 shell 为 Bash，工作目录 `/home/drew/workspace/Moss`，通过 `scripts/remote-build.sh` 构建。
-- 本地 ROM 位于 `/Users/drew/workspace/palmos_roms`，包含 3.1、3.5 与 4.0；`run.sh` 默认使用 Palm IIIx 3.1 ROM。
-- 已落实：`build.sh` 通过 tar/SSH 上传源码、构建并取回 `dist/Moss.prc`，`run.sh` 安装运行。
+- 本地 ROM 位于 `/Users/drew/workspace/palmos_roms`，包含 3.1、3.5 与 4.0；MCP 默认验证选择 Palm IIIx 3.1 ROM。
+- 已落实：`build.sh` 通过 tar/SSH 上传源码、构建并取回 `dist/Moss.prc`，通过 Palm OS MCP 安装运行。
 - 模拟器网络配置及其连接 OpenAI 兼容 API的方式。
 
 已通过更新后的 `drew@192.168.50.167` 执行远程编译并取回 PRC。远程使用 Cygwin 与 `C:\Handspring\prc-tools`（GCC 2.95.2、SDK 3.5）；本地已在 Palm OS 3.1 ROM 上验证基本问答、上下文、记录恢复、连接测试与失败重试。逐项运行结果与未覆盖项目记录在 `VALIDATION.md`。

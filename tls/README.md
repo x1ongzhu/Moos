@@ -1,4 +1,8 @@
-# Moss TLS Library
+> 历史 TLS 实验文档：下文构建与 `run.sh` 命令保留用于解释旧实验，不是当前代理版运行流程。当前模拟器启动、安装和验证统一使用 Palm OS MCP，见 [项目 README](../README.md#构建与运行)。
+
+# Moss TLS Library（历史实验）
+
+当前 Moss 已改用 HTTP 中间代理；本目录保留此前 Palm TLS 实验，不属于默认构建或运行依赖。以下描述历史实现。
 
 Palm OS 3.1–4.0 / Motorola 68000 的独立共享库，数据库名称 `Moss TLS Library`，类型 `libr`，Creator `MTLS`。其他原生应用可只包含 `MossTLS.h` 并安装 `MossTLS.prc`，不依赖 Moss 聊天客户端。
 
@@ -22,7 +26,7 @@ Palm OS 3.1–4.0 / Motorola 68000 的独立共享库，数据库名称 `Moss TL
 4. `MossTLSCreate(ref, netRef, socket, host, &session)`；host 必须为不含端口的 DNS 名称，用于 SNI 与证书校验。
 5. 反复调用 `MossTLSPump(ref, session, &state, &detail)`，直到 `state & MT_STATE_READY`。若同时有 `MT_STATE_RECONNECT`，证书已经完成首次验证；为避开服务器空闲超时，Moss 先销毁当前会话并关闭 socket，保留已打开的库，再连接并创建新会话。
 6. `MossTLSWrite` / `MossTLSRead` 处理明文；每次可能只处理部分数据或返回零长度，期间持续调用 Pump。
-7. 完成或取消时 `MossTLSDestroy`；关闭调用方持有的 socket / Net Library。
+7. 取消或最终关闭时 `MossTLSDestroy`；关闭调用方持有的 socket / Net Library。Moss 在成功、边界完整且允许持续连接的响应后保留该 TLS 会话与 socket 最多 60 秒，供同一来源的下一次请求复用。
 8. `MossTLSClose` 返回成功后可 `SysLibRemove(ref)`；返回 `mtErrBusy` 时不能移除。
 
 库不接管 socket 所有权、不存储 API Key、不解释 HTTP。Pump 的一次 ACK 可能进行较长的密码运算；当前不支持在此期间抢占取消。`MossTLSGetStats` 提供密文累计字节及状态，`MossTLSLastX509Error` 提供 BearSSL X.509 状态（32 为校验成功）。

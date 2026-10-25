@@ -1,5 +1,28 @@
 #include "protocol.h"
 
+void moss_display_ascii(char *text) {
+    unsigned char *p=(unsigned char *)text,*out=p,c;
+    unsigned need,i; unsigned long cp;
+    while(*p) {
+        c=*p++;
+        if(c<128) { *out++=c; continue; }
+        if(c>=0xc2 && c<=0xdf) { need=1; cp=c&31; }
+        else if(c>=0xe0 && c<=0xef) { need=2; cp=c&15; }
+        else if(c>=0xf0 && c<=0xf4) { need=3; cp=c&7; }
+        else { *out++='?'; continue; }
+        for(i=0;i<need && (*p&0xc0)==0x80;++i) cp=(cp<<6)|(*p++&63);
+        if(i!=need) { *out++='?'; continue; }
+        if((cp>=0x2018UL && cp<=0x201bUL) || cp==0x2032UL || cp==0xff07UL) *out++='\'';
+        else if((cp>=0x201cUL && cp<=0x201fUL) || cp==0x2033UL || cp==0xff02UL) *out++='"';
+        else if((cp>=0x2010UL && cp<=0x2015UL) || cp==0x2212UL) *out++='-';
+        else if(cp==0x2026UL) { *out++='.'; *out++='.'; *out++='.'; }
+        else if(cp==0xa0UL || cp==0x202fUL) *out++=' ';
+        else if(cp==0x2022UL || cp==0xb7UL) *out++='*';
+        else *out++='?';
+    }
+    *out=0;
+}
+
 static unsigned slen(const char *s) { unsigned n=0; while (s[n]) ++n; return n; }
 static int equal(const char *s, const char *t, unsigned n) {
     while(n--) if(*s++ != *t++) return 0;
@@ -59,7 +82,7 @@ static void quote(Writer *w,const char *s) {
 }
 static void body(Writer *w, const char *model, const MossMessage *m,unsigned count) {
     unsigned i;
-    str(w,"{\"model\":"); quote(w,model); str(w,",\"stream\":false,\"messages\":[");
+    str(w,"{\"model\":"); quote(w,model); str(w,",\"stream\":true,\"messages\":[");
     for(i=0;i<count;++i) {
         if(i) put(w,','); str(w,"{\"role\":"); quote(w,m[i].role);
         str(w,",\"content\":"); quote(w,m[i].text); put(w,'}');
@@ -77,21 +100,22 @@ int moss_request(char *out,unsigned cap,const MossURL *u,const char *key,
     w.n=0; out[0]=0;
     str(&w,"POST "); str(&w,u->path); str(&w,"/chat/completions HTTP/1.1\r\nHost: ");
     str(&w,u->host); put(&w,':'); number(&w,u->port);
-    str(&w,"\r\nContent-Type: application/json\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\n");
+    str(&w,"\r\nContent-Type: application/json\r\nAccept: text/plain\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n");
     if(*key) { str(&w,"Authorization: Bearer "); str(&w,key); str(&w,"\r\n"); }
     str(&w,"Content-Length: "); number(&w,contentLen); str(&w,"\r\n\r\n");
     body(&w,model,m,count);
     return w.ok ? (int)w.n : -1;
 }
 
-typedef struct { unsigned offset, length; int status, chunked, hasLength; } Headers;
-static int headers(const char *s,unsigned n,Headers *h) {
+typedef struct { unsigned offset; unsigned long length; int status, chunked, hasLength, persistent, close, text; } Headers;
+static int headers(const char *s,unsigned n,Headers *h,unsigned long limit) {
     unsigned i=0, end=0, a,b,k,v;
-    h->length=0; h->hasLength=0; h->chunked=0;
+    h->length=0; h->hasLength=0; h->chunked=0; h->persistent=0; h->close=0; h->text=0;
     for(i=0;i+3<n;++i) if(equal(s+i,"\r\n\r\n",4)) { end=i+4; break; }
     if(!end) return n>4096 ? -1 : 0;
     if(end>4096 || n<12 || (!equal(s,"HTTP/1.0 ",9) && !equal(s,"HTTP/1.1 ",9))) return -1;
     for(i=9;i<12;++i) if(s[i]<'0' || s[i]>'9') return -1;
+    h->persistent=s[7]=='1';
     h->status=(s[9]-'0')*100+(s[10]-'0')*10+s[11]-'0';
     i=12; while(i+1<end && !(s[i]=='\r' && s[i+1]=='\n')) ++i; i+=2;
     while(i+1<end && s[i]!='\r') {
@@ -102,12 +126,26 @@ static int headers(const char *s,unsigned n,Headers *h) {
         v=i; while(v>k && (s[v-1]==' ' || s[v-1]=='\t')) --v;
         if(b-a==14 && iequal(s+a,"Content-Length",14)) {
             unsigned long len=0; unsigned j; if(k==v || h->hasLength) return -1;
-            for(j=k;j<v;++j) { if(s[j]<'0'||s[j]>'9'||len>MOSS_HTTP_MAX) return -1; len=len*10+s[j]-'0'; }
-            if(len>MOSS_HTTP_MAX) return -1; h->length=len; h->hasLength=1;
+            for(j=k;j<v;++j) { if(s[j]<'0'||s[j]>'9'||len>limit) return -1; len=len*10+s[j]-'0'; }
+            if(len>limit) return -1; h->length=len; h->hasLength=1;
         }
         if(b-a==17 && iequal(s+a,"Transfer-Encoding",17)) {
             if(v-k!=7 || !iequal(s+k,"chunked",7) || h->chunked) return -1;
             h->chunked=1;
+        }
+        if(b-a==10 && iequal(s+a,"Connection",10)) {
+            unsigned j=k, t, z;
+            while(j<v) {
+                while(j<v && (s[j]==' ' || s[j]=='\t' || s[j]==',')) ++j;
+                t=j; while(j<v && s[j]!=',') ++j; z=j;
+                while(z>t && (s[z-1]==' ' || s[z-1]=='\t')) --z;
+                if(z-t==5 && iequal(s+t,"close",5)) h->close=1;
+                if(z-t==10 && iequal(s+t,"keep-alive",10)) h->persistent=1;
+            }
+        }
+        if(b-a==12 && iequal(s+a,"Content-Type",12)) {
+            if(v-k>=10 && iequal(s+k,"text/plain",10) &&
+               (v-k==10 || s[k+10]==';' || s[k+10]==' ')) h->text=1;
         }
         if(b-a==16 && iequal(s+a,"Content-Encoding",16)) {
             if(v-k!=8 || !iequal(s+k,"identity",8)) return -1;
@@ -122,7 +160,7 @@ static int hexval(char c) {
     c=lower(c); return c>='a' && c<='f' ? c-'a'+10 : -1;
 }
 /* Validate the complete chunk stream before moving any bytes. */
-static int chunks(const char *s,unsigned n,unsigned start,char *dest,int *decoded) {
+static int chunks(const char *s,unsigned n,unsigned start,char *dest,int *decoded,unsigned *consumed) {
     unsigned i=start, len, digits, j, out=0; int h;
     while(i<n) {
         len=0; digits=0;
@@ -135,8 +173,8 @@ static int chunks(const char *s,unsigned n,unsigned start,char *dest,int *decode
         if(i+1>=n) return 0;
         if(s[i]!='\r'||s[i+1]!='\n') return -1; i+=2;
         if(!len) {
-            if(i+1<n && s[i]=='\r' && s[i+1]=='\n') { *decoded=(int)out; return 1; }
-            for(j=i;j+3<n;++j) if(equal(s+j,"\r\n\r\n",4)) { *decoded=(int)out; return 1; }
+            if(i+1<n && s[i]=='\r' && s[i+1]=='\n') { *decoded=(int)out; if(consumed) *consumed=i+2; return 1; }
+            for(j=i;j+3<n;++j) if(equal(s+j,"\r\n\r\n",4)) { *decoded=(int)out; if(consumed) *consumed=j+4; return 1; }
             return 0;
         }
         if(n-i<len+2) return 0;
@@ -148,17 +186,23 @@ static int chunks(const char *s,unsigned n,unsigned start,char *dest,int *decode
 }
 int moss_http_complete(const char *s,unsigned n,int eof) {
     Headers h; int r, decoded;
-    r=headers(s,n,&h); if(r<=0) return eof ? -1 : r;
-    if(h.chunked) { r=chunks(s,n,h.offset,0,&decoded); return !r && eof ? -1 : r; }
+    r=headers(s,n,&h,MOSS_HTTP_MAX); if(r<=0) return eof ? -1 : r;
+    if(h.chunked) { r=chunks(s,n,h.offset,0,&decoded,0); return !r && eof ? -1 : r; }
     if(h.hasLength) return n-h.offset>=h.length ? 1 : (eof ? -1 : 0);
     return eof ? 1 : 0;
 }
+int moss_http_reusable(const char *s,unsigned n) {
+    Headers h; int decoded; unsigned consumed=0;
+    if(headers(s,n,&h,MOSS_HTTP_MAX)!=1 || !h.persistent || h.close || h.status<200) return 0;
+    if(h.chunked) return chunks(s,n,h.offset,0,&decoded,&consumed)==1 && consumed==n;
+    return h.hasLength && n-h.offset==h.length;
+}
 int moss_http_body(char *s,unsigned n,int *status) {
     Headers h; unsigned i,len; int decoded;
-    if(headers(s,n,&h)!=1) return -1; *status=h.status;
+    if(headers(s,n,&h,MOSS_HTTP_MAX)!=1) return -1; *status=h.status;
     if(h.chunked) {
-        if(chunks(s,n,h.offset,0,&decoded)!=1) return -1;
-        if(chunks(s,n,h.offset,s,&decoded)!=1) return -1;
+        if(chunks(s,n,h.offset,0,&decoded,0)!=1) return -1;
+        if(chunks(s,n,h.offset,s,&decoded,0)!=1) return -1;
         len=(unsigned)decoded;
     } else {
         len=h.hasLength ? h.length : n-h.offset;
@@ -168,101 +212,118 @@ int moss_http_body(char *s,unsigned n,int *status) {
     s[len]=0; return (int)len;
 }
 
-/* Small recursive JSON reader. No token table or allocations; nesting is bounded. */
-static const char *space(const char *p) { while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n') ++p; return p; }
-static const char *jstring(const char *p) {
-    unsigned i; if(*p++!='"') return 0;
-    while(*p && *p!='"') {
-        if((unsigned char)*p<32) return 0;
-        if(*p++=='\\') {
-            if(*p=='u') { ++p; for(i=0;i<4;++i) { if(hexval(*p)<0) return 0; ++p; } }
-            else { if(!*p || !(*p=='"'||*p=='\\'||*p=='/'||*p=='b'||*p=='f'||*p=='n'||*p=='r'||*p=='t')) return 0; ++p; }
-        }
-    }
-    return *p=='"' ? p+1 : 0;
+void moss_stream_init(MossStream *s) {
+    unsigned i; char *p=(char *)s;
+    for(i=0;i<sizeof(*s);++i) p[i]=0;
 }
-static const char *skip(const char *p,unsigned depth) {
-    char end; const char *q;
-    if(depth>24) return 0; p=space(p);
-    if(*p=='"') return jstring(p);
-    if(*p=='{' || *p=='[') {
-        end=*p=='{' ? '}' : ']'; p=space(p+1);
-        if(*p==end) return p+1;
-        for(;;) {
-            if(end=='}') { p=jstring(p); if(!p) return 0; p=space(p); if(*p++!=':') return 0; }
-            p=skip(p,depth+1); if(!p) return 0; p=space(p);
-            if(*p==end) return p+1;
-            if(*p++!=',') return 0; p=space(p);
-        }
-    }
-    if(slen(p)>=4 && (equal(p,"true",4)||equal(p,"null",4))) return p+4;
-    if(slen(p)>=5 && equal(p,"false",5)) return p+5;
-    q=p; if(*p=='-') ++p;
-    if(*p=='0') ++p;
-    else { if(*p<'1'||*p>'9') return 0; do { ++p; } while(*p>='0'&&*p<='9'); }
-    if(*p=='.') { ++p; if(*p<'0'||*p>'9') return 0; while(*p>='0'&&*p<='9') ++p; }
-    if(*p=='e'||*p=='E') { ++p; if(*p=='+'||*p=='-') ++p; if(*p<'0'||*p>'9') return 0; while(*p>='0'&&*p<='9') ++p; }
-    return p>q ? p : 0;
+static int stream_error(MossStream *s,const char *message) {
+    copy(s->error,sizeof(s->error),message,slen(message)); s->failed=1; s->reusable=0; return -1;
 }
-static const char *property(const char *p,const char *name) {
-    const char *k,*end; unsigned n=slen(name);
-    p=space(p); if(*p++!='{') return 0; p=space(p);
-    while(*p && *p!='}') {
-        k=p; end=jstring(p); if(!end) return 0;
-        p=space(end); if(*p++!=':') return 0; p=space(p);
-        if((unsigned)(end-k)==n+2 && equal(k+1,name,n)) return p;
-        p=skip(p,0); if(!p) return 0; p=space(p); if(*p!=',') return 0; p=space(p+1);
-    }
+static int stream_append(MossStream *s,const char *bytes,unsigned n) {
+    unsigned i;
+    if(s->status<200 || s->status>=300) {
+        if(s->errorUsed+n<sizeof(s->error)) {
+            for(i=0;i<n;++i) s->error[s->errorUsed++]=bytes[i];
+            s->error[s->errorUsed]=0;
+        }
+    } else if(!s->truncated && s->used+n<=MOSS_REPLY_MAX) {
+        for(i=0;i<n;++i) s->answer[s->used++]=bytes[i];
+        s->answer[s->used]=0;
+    } else s->truncated=1;
     return 0;
 }
-static unsigned long code4(const char *p) { unsigned long n=0; unsigned i; for(i=0;i<4;++i) n=n*16+(unsigned)hexval(p[i]); return n; }
-static int decode(const char *p,char *out,unsigned cap,int *truncated) {
-    unsigned used=0,n,i; unsigned long c,lo; char bytes[4];
-    if(!cap || !p || *p!='"' || !jstring(p)) return -1;
-    ++p; *truncated=0;
-    while(*p!='"') {
-        c=(unsigned char)*p++; n=1; bytes[0]=(char)c;
-        if(c=='\\') {
-            c=(unsigned char)*p++;
-            if(c=='u') {
-                c=code4(p); p+=4;
-                if(c>=0xd800 && c<=0xdbff) {
-                    if(p[0]!='\\'||p[1]!='u') return -1;
-                    lo=code4(p+2); if(lo<0xdc00||lo>0xdfff) return -1;
-                    p+=6; c=0x10000+((c-0xd800)<<10)+lo-0xdc00;
-                } else if(c>=0xdc00 && c<=0xdfff) return -1;
-                if(!c) return -1; /* Palm text fields cannot contain embedded NUL. */
-                if(c<128) { n=1; bytes[0]=(char)c; }
-                else if(c<2048) { n=2; bytes[0]=(char)(0xc0|(c>>6)); bytes[1]=(char)(0x80|(c&63)); }
-                else if(c<65536) { n=3; bytes[0]=(char)(0xe0|(c>>12)); bytes[1]=(char)(0x80|((c>>6)&63)); bytes[2]=(char)(0x80|(c&63)); }
-                else { n=4; bytes[0]=(char)(0xf0|(c>>18)); bytes[1]=(char)(0x80|((c>>12)&63)); bytes[2]=(char)(0x80|((c>>6)&63)); bytes[3]=(char)(0x80|(c&63)); }
-            } else {
-                if(c=='n') c='\n'; else if(c=='r') c='\r'; else if(c=='t') c='\t';
-                else if(c=='b') c='\b'; else if(c=='f') c='\f'; bytes[0]=(char)c;
-            }
-        } else if(c>=128) {
-            if(c>=0xc2 && c<=0xdf) n=2;
-            else if(c>=0xe0 && c<=0xef) n=3;
-            else if(c>=0xf0 && c<=0xf4) n=4;
-            else return -1;
-            for(i=1;i<n;++i) { if(((unsigned char)*p&0xc0)!=0x80) return -1; bytes[i]=*p++; }
-            lo=(unsigned char)bytes[1];
-            if((c==0xe0&&lo<0xa0)||(c==0xed&&lo>=0xa0)||(c==0xf0&&lo<0x90)||(c==0xf4&&lo>=0x90)) return -1;
-        }
-        if(!*truncated && used+n<cap) for(i=0;i<n;++i) out[used++]=bytes[i];
-        else *truncated=1;
+static int stream_body_byte(MossStream *s,char value) {
+    unsigned char c=(unsigned char)value,first,second;
+    if(!s->utf8Used) {
+        if(!c) return stream_error(s,"NUL byte in response.");
+        if(c<128) return stream_append(s,&value,1);
+        if(c>=0xc2 && c<=0xdf) s->utf8Need=2;
+        else if(c>=0xe0 && c<=0xef) s->utf8Need=3;
+        else if(c>=0xf0 && c<=0xf4) s->utf8Need=4;
+        else return stream_error(s,"Invalid UTF-8 response.");
+        s->utf8[s->utf8Used++]=value; return 0;
     }
-    out[used]=0; return (int)used;
+    if((c&0xc0)!=0x80) return stream_error(s,"Invalid UTF-8 continuation.");
+    s->utf8[s->utf8Used++]=value;
+    if(s->utf8Used<s->utf8Need) return 0;
+    first=(unsigned char)s->utf8[0]; second=(unsigned char)s->utf8[1];
+    if((first==0xe0 && second<0xa0) || (first==0xed && second>=0xa0) ||
+       (first==0xf0 && second<0x90) || (first==0xf4 && second>=0x90))
+        return stream_error(s,"Invalid UTF-8 code point.");
+    s->utf8Used=0; return stream_append(s,s->utf8,s->utf8Need);
 }
-int moss_reply(const char *json,char *out,unsigned cap,int *truncated) {
-    const char *p=skip(json,0); if(!p || *space(p)) return -1;
-    p=property(json,"choices"); if(!p||*p!='[') return -1;
-    p=property(space(p+1),"message"); if(!p) return -1;
-    p=property(p,"content"); return decode(p,out,cap,truncated);
+static int stream_finish(MossStream *s) {
+    if(s->utf8Used) return stream_error(s,"Response ended inside a UTF-8 character.");
+    if(s->status<200 || s->status>=300) {
+        s->failed=1; s->reusable=0;
+        if(!s->errorUsed) return stream_error(s,"API request failed.");
+        return -1;
+    }
+    if(!s->used) return stream_error(s,"API returned an empty text answer.");
+    s->complete=1; return 1;
 }
-int moss_error(const char *json,char *out,unsigned cap) {
-    const char *p=skip(json,0); int trunc;
-    if(!p || *space(p)) return -1;
-    p=property(json,"error"); if(!p) return -1;
-    p=property(p,"message"); return decode(p,out,cap,&trunc);
+int moss_stream_feed(MossStream *s,const char *data,unsigned size,int eof) {
+    unsigned i,j,digits; int r,h; unsigned long length; char c; Headers head;
+    if(s->failed) return -1;
+    for(i=0;i<size;++i) {
+        if(s->complete) return stream_error(s,"Extra bytes after HTTP response.");
+        if(++s->total>MOSS_STREAM_WIRE_MAX) return stream_error(s,"Streaming response exceeds wire limit.");
+        c=data[i];
+        if(!s->headersDone) {
+            if(s->headerUsed==MOSS_HEADER_MAX) return stream_error(s,"HTTP headers too large.");
+            s->header[s->headerUsed++]=c;
+            if(s->headerUsed<4 || !equal(s->header+s->headerUsed-4,"\r\n\r\n",4)) continue;
+            if(headers(s->header,s->headerUsed,&head,MOSS_STREAM_WIRE_MAX)!=1)
+                return stream_error(s,"Invalid HTTP response headers.");
+            s->status=head.status; s->headersDone=1;
+            if(head.status>=200 && head.status<300 && (!head.text || (!head.chunked && !head.hasLength)))
+                return stream_error(s,"Expected framed text/plain from updated relay.");
+            s->reusable=head.persistent && !head.close && (head.chunked || head.hasLength);
+            s->mode=head.chunked?1:(head.hasLength?2:3); s->remaining=head.length;
+            s->headerUsed=0;
+            if(s->mode==2 && !s->remaining && stream_finish(s)<0) return -1;
+            continue;
+        }
+        if(s->mode==1) {
+            if(s->chunkState==0 || s->chunkState==4) {
+                if(s->headerUsed==MOSS_HEADER_MAX || (s->chunkState==0 && s->headerUsed==128))
+                    return stream_error(s,"HTTP chunk framing too large.");
+                s->header[s->headerUsed++]=c;
+                if(s->chunkState==4 && ++s->trailerUsed>MOSS_HEADER_MAX)
+                    return stream_error(s,"HTTP trailers too large.");
+                if(c!='\n') continue;
+                if(s->headerUsed<2 || s->header[s->headerUsed-2]!='\r')
+                    return stream_error(s,"Invalid HTTP chunk line.");
+                if(s->chunkState==4) {
+                    if(s->headerUsed==2 && stream_finish(s)<0) return -1;
+                    s->headerUsed=0; continue;
+                }
+                length=0; digits=0;
+                for(j=0;j+2<s->headerUsed && (h=hexval(s->header[j]))>=0;++j) {
+                    if(length>MOSS_STREAM_WIRE_MAX/16) return stream_error(s,"HTTP chunk too large.");
+                    length=length*16+(unsigned)h; ++digits;
+                }
+                if(!digits || length>MOSS_STREAM_WIRE_MAX ||
+                   (j+2!=s->headerUsed && s->header[j]!=';'))
+                    return stream_error(s,"Invalid HTTP chunk size.");
+                s->chunkRemaining=length; s->chunkState=length?1:4; s->headerUsed=0; continue;
+            }
+            if(s->chunkState==2 || s->chunkState==3) {
+                if(c!=(s->chunkState==2?'\r':'\n')) return stream_error(s,"Invalid chunk terminator.");
+                s->chunkState=s->chunkState==2?3:0; continue;
+            }
+            if(stream_body_byte(s,c)<0) return -1;
+            if(!--s->chunkRemaining) s->chunkState=2;
+        } else {
+            if(stream_body_byte(s,c)<0) return -1;
+            if(s->mode==2 && !--s->remaining && stream_finish(s)<0) return -1;
+        }
+    }
+    if(eof) s->reusable=0;
+    if(eof && !s->complete) {
+        s->reusable=0;
+        if(s->headersDone && s->mode==3) { r=stream_finish(s); if(r<0) return r; }
+        else return stream_error(s,"Connection closed before HTTP response completed.");
+    }
+    return s->complete?1:0;
 }
